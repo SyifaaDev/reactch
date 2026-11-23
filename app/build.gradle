@@ -1,0 +1,35 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.carrace'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.carrace'
+        minSdk 21
+        targetSdk 36
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Tanpa dependensi androidx/AppCompat: hanya API platform (WebView) supaya tetap jalan di Android 5.
+dependencies {
+}
