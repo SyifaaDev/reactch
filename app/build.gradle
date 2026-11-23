@@ -32,4 +32,5 @@ android {
 
 // Tanpa dependensi androidx/AppCompat: hanya API platform (WebView) supaya tetap jalan di Android 5.
 dependencies {
+    implementation 'androidx.core:core:1.15.0'
 }
