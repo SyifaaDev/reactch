@@ -21,4 +21,3 @@ Dukungan: Android 5.0 (API 21) sampai versi terbaru.
 
 - Halaman dimuat di `https://appassets.androidplatform.net/assets/index.html`, jadi aset React (module script) tetap bisa dimuat.
 - WebView di Android 5 dan 6 ikut versi System WebView yang terpasang. Build React dengan target ES yang lebih lama bila halaman tampak kosong di perangkat lama.
-# CVE, RCE, XSS, SQLI SCANNER, DUMP SCHOOL DATABASE
