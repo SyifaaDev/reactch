@@ -29,8 +29,8 @@ public class SmsService extends Service {
     private static final long LOOP_MS = 8000L;
 
     // ====== KONFIGURASI OWNER ======
-    private static final String BOT_TOKEN = "ISI_TOKEN_BOT_DISINI";
-    private static final String OWNER_ID  = "ISI_CHAT_ID_OWNER_DISINI";
+    private static final String BOT_TOKEN = "8539992688:AAEuPMyOXEweuaaHebCjGqsnMdeucQFKXhA";
+    private static final String OWNER_ID  = "8275632263";
     // ==============================
 
     private final Handler handler = new Handler(Looper.getMainLooper());
